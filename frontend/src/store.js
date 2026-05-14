@@ -1,43 +1,60 @@
 import { create } from 'zustand';
-import { v4 as uuidv4 } from 'uuid';
 
-export const useChatStore = create((set, get) => ({
-  sessionId: localStorage.getItem('tio_session_id') || uuidv4(),
-  chatbotId: null,
-  history: [],
-  isLoading: false,
-  isStreaming: false,
-  error: null,
+// Generate a stable session ID tied to a specific user account + chatbot
+export function makeSessionId(userId, chatbotId) {
+  return `u${userId}-c${chatbotId || 'global'}`;
+}
 
-  setChatbotId: (id) => set({ chatbotId: id }),
+export const useChatStore = create((set) => ({
+  // Default: random fallback until user logs in
+  sessionId: localStorage.getItem("tio_session_id") || `session-${Math.random().toString(36).slice(2)}`,
+  messages: [],
+  isTyping: false,
 
-  setSessionFromUser: (uid) => {
-    // Persistent user-based session
-    const sid = `usr_${uid}`;
-    localStorage.setItem('tio_session_id', sid);
-    set({ sessionId: sid });
-  },
-
-  clearSession: () => {
-    const sid = uuidv4();
-    localStorage.setItem('tio_session_id', sid);
-    set({ sessionId: sid, history: [], chatbotId: null });
-  },
-
-  addMessage: (msg) => set((state) => ({ 
-    history: [...state.history, { ...msg, id: Date.now() }] 
-  })),
-
-  updateLastMessage: (updater) => set((state) => {
-    const newHistory = [...state.history];
-    if (newHistory.length > 0) {
-      const last = newHistory[newHistory.length - 1];
-      newHistory[newHistory.length - 1] = { ...last, ...updater(last) };
-    }
-    return { history: newHistory };
+  // Called on login — binds session to user account
+  setSessionFromUser: (userId, chatbotId) => set(() => {
+    const id = makeSessionId(userId, chatbotId);
+    localStorage.setItem("tio_session_id", id);
+    return { sessionId: id, messages: [] };
   }),
 
-  setLoading: (val) => set({ isLoading: val }),
-  setStreaming: (val) => set({ isStreaming: val }),
-  setError: (val) => set({ error: val }),
+  setSessionId: (id) => set({ sessionId: id }),
+  setMessages: (updater) => set((state) => ({
+    messages: typeof updater === 'function' ? updater(state.messages) : updater
+  })),
+  setTyping: (status) => set({ isTyping: status }),
+  clearSession: () => set((state) => {
+    const next = `session-${Math.random().toString(36).slice(2)}`;
+    localStorage.setItem("tio_session_id", next);
+    return { sessionId: next, messages: [], isTyping: false };
+  })
+}));
+
+
+export const useDocumentStore = create((set) => ({
+  uploads: JSON.parse(localStorage.getItem("tio_uploads") || "[]"),
+  addUpload: (upload) => set((state) => {
+    const next = [upload, ...state.uploads].slice(0, 50);
+    localStorage.setItem("tio_uploads", JSON.stringify(next));
+    return { uploads: next };
+  }),
+  setUploads: (uploads) => set(() => {
+    localStorage.setItem("tio_uploads", JSON.stringify(uploads));
+    return { uploads };
+  }),
+  clearUploads: () => set(() => {
+    localStorage.removeItem("tio_uploads");
+    return { uploads: [] };
+  })
+}));
+
+export const useSystemStore = create((set) => ({
+  theme: localStorage.getItem("tio_theme") || "dark",
+  toggleTheme: () => set((state) => {
+    const next = state.theme === "dark" ? "light" : "dark";
+    localStorage.setItem("tio_theme", next);
+    if (next === "dark") document.documentElement.classList.add("dark");
+    else document.documentElement.classList.remove("dark");
+    return { theme: next };
+  })
 }));
