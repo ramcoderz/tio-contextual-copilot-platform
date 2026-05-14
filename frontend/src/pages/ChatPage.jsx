@@ -39,7 +39,10 @@ const STATUS_MAP = {
 export default function ChatPage() {
   const [searchParams] = useSearchParams();
   const chatbotId = searchParams.get('chatbot_id');
-  const { messages, setMessages, sessionId, setSessionFromUser, setSessionId } = useChatStore();
+  const { 
+    messages, setMessages, sessionId, syncSession, wsStatus, setWsStatus 
+  } = useChatStore();
+  
   const [input, setInput] = useState('');
   const [isTyping, setIsTyping] = useState(false);
   const [chatbot, setChatbot] = useState(null);
@@ -55,106 +58,123 @@ export default function ChatPage() {
   const textareaRef = useRef(null);
   const reconnectAttempts = useRef(0);
 
+  // 1. SERIALIZED INITIALIZATION FLOW
   useEffect(() => {
-    if (chatbotId) {
+    async function initializeSystem() {
+      if (!chatbotId) return;
+
+      // Step A: Reset and Load Chatbot Metadata
       setChatbot(null);
       setActiveSources([]);
       setIsTyping(false);
-      setInput(''); // Clear input when switching chats
-      api(`/chatbots/${chatbotId}`).then(setChatbot).catch(() => {});
       
-      const storedUserId = localStorage.getItem('tio_user_id');
-      if (storedUserId) {
-        const expectedSessionId = `u${storedUserId}-c${chatbotId}`;
-        if (sessionId !== expectedSessionId) {
-          setSessionFromUser(parseInt(storedUserId), chatbotId);
+      try {
+        const botData = await api(`/chatbots/${chatbotId}`);
+        setChatbot(botData);
+        
+        // Step B: Authenticate & Sync Session
+        const storedUserId = localStorage.getItem('tio_user_id') || 'guest';
+        const expectedSuffix = `-c${chatbotId}`;
+        
+        // Only sync if strictly necessary to avoid loops
+        if (!sessionId || !sessionId.endsWith(expectedSuffix)) {
+          console.info(`[SYSTEM] Synchronizing session for chatbot=${chatbotId}`);
+          syncSession(storedUserId, chatbotId);
         }
-      } else {
-        // Guest session synchronization
-        const expectedSessionId = `guest-c${chatbotId}`;
-        if (sessionId !== expectedSessionId && !sessionId.includes(`-c${chatbotId}`)) {
-          setSessionId(expectedSessionId);
-        }
+      } catch (err) {
+        console.error("[SYSTEM] Initialization failed", err);
       }
     }
-  }, [chatbotId, sessionId, setSessionFromUser, setSessionId]);
+    initializeSystem();
+  }, [chatbotId, sessionId, syncSession]);
 
+  // 2. PROTECTED WEBSOCKET INITIALIZATION
   const connectWS = useCallback(() => {
-    // Only connect if sessionId is synchronized with the current chatbotId
-    if (chatbotId && !sessionId.includes(`-c${chatbotId}`)) {
-      console.log('[WS] Skipping connection - sessionId not synchronized yet');
-      return;
-    }
-    
+    // STRICT GUARDS
+    if (!chatbotId || !sessionId) return;
+    if (!sessionId.endsWith(`-c${chatbotId}`)) return; // Ensure sync completion
+    if (wsStatus === 'connected' || wsStatus === 'connecting') return;
+
+    setWsStatus('connecting');
+    console.info(`[WS] Initializing connection for session=${sessionId}`);
+
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const host = window.location.host === 'localhost:5173' ? 'localhost:8000' : window.location.host;
     const token = localStorage.getItem('token') || '';
-    
-    // Explicitly close old socket if it exists
+
     if (wsRef.current) {
       wsRef.current.close();
       wsRef.current = null;
     }
 
-    const ws = new WebSocket(`${protocol}//${host}/ws/chat/${sessionId}?token=${encodeURIComponent(token)}`);
-    wsRef.current = ws;
+    try {
+      const ws = new WebSocket(`${protocol}//${host}/ws/chat/${sessionId}?token=${encodeURIComponent(token)}`);
+      wsRef.current = ws;
 
-    ws.onmessage = (event) => {
-      const data = JSON.parse(event.data);
-      if (data.type === 'metadata') {
-        if (data.citations) setActiveSources(data.citations);
-      } else if (data.type === 'thought') {
-        setMessages(prev => {
-          const last = prev[prev.length - 1];
-          if (last?.role === 'assistant') {
-            return [...prev.slice(0, -1), { ...last, thought: data.content }];
-          }
-          return [...prev, { role: 'assistant', content: '', thought: data.content, _streaming: true }];
-        });
-      } else if (data.type === 'token') {
-        setIsTyping(false);
-        setMessages(prev => {
-          const last = prev[prev.length - 1];
-          if (last?.role === 'assistant' && last._streaming) {
-            return [...prev.slice(0, -1), { ...last, content: last.content + data.content }];
-          }
-          return [...prev, { role: 'assistant', content: data.content, _streaming: true }];
-        });
-      } else if (data.type === 'final') {
-        setIsTyping(false);
-        setMessages(prev => {
-          const last = prev[prev.length - 1];
-          if (last?.role === 'assistant') {
-            return [...prev.slice(0, -1), { role: 'assistant', content: data.answer, sources: data.citations, _streaming: false }];
-          }
-          return prev;
-        });
-      } else if (data.error) {
-        setIsTyping(false);
-        setMessages(prev => [...prev, { role: 'assistant', content: `⚠️ ${data.error}` }]);
-      }
-    };
+      ws.onopen = () => {
+        setWsStatus('connected');
+        reconnectAttempts.current = 0;
+        console.info(`[WS] Protocol established for ${sessionId}`);
+      };
 
-    ws.onopen = () => { reconnectAttempts.current = 0; };
-    ws.onclose = () => {
-      reconnectAttempts.current++;
-      if (reconnectAttempts.current < 5) {
-        setTimeout(connectWS, Math.min(1000 * Math.pow(2, reconnectAttempts.current), 10000));
-      }
-    };
-  }, [sessionId, chatbotId, setMessages]);
+      ws.onmessage = (event) => {
+        const data = JSON.parse(event.data);
+        
+        // Dynamic Update Routing
+        if (data.type === 'metadata') {
+          if (data.citations) setActiveSources(data.citations);
+        } else if (data.type === 'token') {
+          setIsTyping(false);
+          setMessages(prev => {
+            const last = prev[prev.length - 1];
+            if (last?.role === 'assistant' && last._streaming) {
+              return [...prev.slice(0, -1), { ...last, content: last.content + data.content }];
+            }
+            return [...prev, { role: 'assistant', content: data.content, _streaming: true }];
+          });
+        } else if (data.type === 'final') {
+          setIsTyping(false);
+          setMessages(prev => {
+            const last = prev[prev.length - 1];
+            if (last?.role === 'assistant') {
+              return [...prev.slice(0, -1), { role: 'assistant', content: data.answer, sources: data.citations, _streaming: false }];
+            }
+            return prev;
+          });
+        }
+      };
+
+      ws.onclose = (e) => {
+        setWsStatus('disconnected');
+        if (e.code !== 1000) { // Not normal closure
+          reconnectAttempts.current++;
+          if (reconnectAttempts.current < 5) {
+            console.warn(`[WS] Connection lost. Retry ${reconnectAttempts.current}/5...`);
+            setTimeout(connectWS, 2000 * reconnectAttempts.current);
+          }
+        }
+      };
+
+      ws.onerror = () => setWsStatus('error');
+
+    } catch (err) {
+      setWsStatus('error');
+      console.error("[WS] Critical failure", err);
+    }
+  }, [sessionId, chatbotId, wsStatus, setWsStatus, setMessages]);
 
   useEffect(() => {
     connectWS();
     return () => { if (wsRef.current) wsRef.current.close(); };
   }, [connectWS]);
 
+  // 3. HISTORY RECOVERY (Only after sync)
   useEffect(() => {
-    if (chatbotId && sessionId.includes(`-c${chatbotId}`)) {
-      setMessages([]); // Clear previous messages while loading
+    if (chatbotId && sessionId?.endsWith(`-c${chatbotId}`)) {
+      setMessages([]);
       api(`/chat/history/${sessionId}?chatbot_id=${chatbotId}`)
         .then(h => { if (Array.isArray(h)) setMessages(h); })
-        .catch(() => { setMessages([]); });
+        .catch(() => setMessages([]));
     }
   }, [chatbotId, sessionId, setMessages]);
 
@@ -303,7 +323,7 @@ export default function ChatPage() {
                 </>
               )}
               <p style={{ fontSize: '10px', color: 'var(--text-dim)', letterSpacing: '0.02em', marginLeft: '4px' }}>
-                SID: {sessionId.split('-')[0]}
+                SID: {sessionId?.split('-')[0] || '...'}
               </p>
             </div>
           </div>
@@ -492,13 +512,13 @@ export default function ChatPage() {
                 <button onClick={startListening} className={`btn ${isListening ? 'btn-premium' : 'btn-ghost'}`} style={{ padding: '10px', borderRadius: '14px' }}>
                   <Mic size={18} />
                 </button>
-                <button onClick={() => sendMessage()} disabled={!input.trim() || isTyping} className="btn btn-primary" style={{ padding: '10px 18px', borderRadius: '14px', color: '#03050c' }}>
+                <button onClick={() => sendMessage()} disabled={!input.trim() || isTyping || wsStatus !== 'connected'} className="btn btn-primary" style={{ padding: '10px 18px', borderRadius: '14px', color: '#03050c' }}>
                   <Send size={18} strokeWidth={2.5} />
                 </button>
               </div>
             </motion.div>
             <p style={{ textAlign: 'center', marginTop: '12px', fontSize: '10px', color: 'var(--text-dim)', letterSpacing: '0.05em', textTransform: 'uppercase' }}>
-              Advanced Neural Architecture · TiO v2.0
+              Status: <span style={{ color: wsStatus === 'connected' ? 'var(--accent)' : 'var(--text-dim)' }}>{wsStatus.toUpperCase()}</span> · TiO v2.0
             </p>
           </div>
         </div>
