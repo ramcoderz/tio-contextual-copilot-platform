@@ -1,0 +1,56 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Local environments
+.env
+.env.*
+.venv
+venv/
+ENV/
+env/
+
+# IDEs
+.vscode/
+.cursor/
+.idea/
+*.swp
+
+# Logs and databases
+logs/
+*.log
+*.db
+*.db-shm
+*.db-wal
+
+# Vector stores and local model files
+vector_db/
+chromadb/
+faiss/
+models/
+
+# Node.js
+node_modules/
+dist/
+build/
+.next/
+
+# Data and temporary files
+data/
+tmp/
+temp/
+cache/
+
+# Personal and College files (Strict cleanup)
+*.pptx
+*.docx
+*report*
+*todo*
+*notes*
+*viva*
+screenshots/
+recordings/
+college/
+scratch/
+tests_experiments/
