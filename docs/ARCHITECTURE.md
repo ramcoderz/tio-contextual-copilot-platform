@@ -1,68 +1,57 @@
-# Technical Architecture
+# TiO Architecture Overview
 
-This document outlines the internal architecture of the TiO Contextual Copilot Platform.
+TiO is designed as a **Contextual Intelligence Platform** that bridges the gap between raw web data and proactive user assistance.
 
-## 1. Data Ingestion Pipeline
+## 1. High-Level Architecture
 
-The ingestion pipeline transforms raw website data and documents into a searchable, structured "Understanding Layer."
+```mermaid
+graph TD
+    User((User)) <--> UI[React Dashboard / Widget]
+    UI <--> WS[WebSocket / FastAPI]
+    
+    subgraph "Intelligence Core"
+        WS <--> OA[Orchestrator Agent]
+        OA <--> CA[Context Aggregator]
+        OA <--> GM[Goal Memory]
+    end
+    
+    subgraph "Ingestion Pipeline"
+        Crawler[Recursive Crawler] --> Parser[Content Parser]
+        Parser --> SI[Site Intelligence Layer]
+        Parser --> VectorStore[(FAISS/ChromaDB)]
+    end
+    
+    OA <--> VectorStore
+    OA <--> SI
+    OA <--> LLM[Ollama / Gemini]
+```
 
-### A. Recursive Crawling
-- **Engines**: Uses `Trafilatura` for high-speed extraction and `Playwright` for complex JavaScript-rendered pages.
-- **Traversal**: BFS (Breadth-First Search) with configurable depth and page limits.
-- **Asset Discovery**: Automatically identifies linked PDFs, Docx, and Txt files for ingestion.
+## 2. Component Breakdown
 
-### B. Processing & Understanding
-- **Chunking**: Implements section-aware chunking to preserve semantic headers and context.
-- **Entity Extraction**: Uses `spaCy` NER to extract people, organizations, locations, and products.
-- **Site Profiling**: Generates a persistent site summary and maps out core workflows using LLM-assisted analysis of the aggregated content.
+### A. The Orchestrator (`orchestrator_agent.py`)
+The brain of the system. It manages the conversation flow, detects intent, expands queries, and synthesizes the final response. It implements a multi-layer prompt strategy (Base → Domain → Skill → Mode → Goal → Context).
 
----
+### B. Ingestion & Site Intelligence (`ingestion/service.py`, `utils/site_intelligence.py`)
+When a website is connected, the crawler performs a recursive BFS traversal. Beyond raw text, it builds a **Site Profile** (Summary, Top Entities, Known Workflows, and Relationships).
 
-## 2. Retrieval & Ranking Strategy
+### C. Contextual Synthesis Engine (`utils/context_intelligence.py`)
+A specialized layer that processes raw retrieval chunks into a `ContextSnapshot`. This ensures the LLM receives "Atomic Facts" and "Workflows" rather than just paragraphs of text.
 
-TiO uses a multi-stage retrieval process to ensure responses are grounded in the most relevant context.
+### D. Goal Persistence (`utils/goal_memory.py`)
+TiO tracks the user's active goal and workflow stage (e.g., `Browsing`, `Evaluating`, `Booking`) across multiple turns. This enables proactive suggestions and workflow-aware retrieval.
 
-### A. Intent & Expansion
-- **Intent Detection**: Lightweight keyword and semantic analysis to categorize the query (e.g., General Chat, Search, Admin).
-- **Query Expansion**: Uses LLMs to generate variations of the user query to bridge vocabulary gaps (e.g., "how to join" -> "admission process").
+## 3. Data Flow
 
-### B. Hybrid Search (RRF)
-- **Dense Search**: Semantic similarity using `BAAI/bge-small-en-v1.5` embeddings stored in FAISS or ChromaDB.
-- **Sparse Search**: Keyword matching using BM25 algorithms.
-- **Fusion**: Reciprocal Rank Fusion (RRF) combines these scores to identify candidates that appear in both search results.
+1. **User Query**: Received via WebSocket or HTTP.
+2. **Expansion**: Query is expanded based on detected domain and intent.
+3. **Retrieval**: 
+    - Pass 1: Semantic search in vector store.
+    - Pass 2: (Optional) Boosted retrieval if a specific workflow is detected.
+    - Pass 3: (Optional) External research via Tavily if local confidence is low.
+4. **Synthesis**: Raw data is structured into a `ContextSnapshot`.
+5. **Planning**: The Orchestrator generates a "Response Plan" (Goal, Workflow, Steps).
+6. **Generation**: Final response is streamed to the user, grounded in the plan and snapshot.
+7. **Tracking**: Latency, confidence, and hallucination flags are logged for audit.
 
-### C. Cross-Encoder Reranking
-- Candidate chunks are re-scored using a Cross-Encoder model (`ms-marco-MiniLM-L-6-v2`) which evaluates the direct relevance of the chunk to the original query.
-
----
-
-## 3. Intelligence & Synthesis Layer
-
-The synthesis layer is what separates TiO from standard RAG systems.
-
-### A. Context Aggregation
-Before generation, the system synthesizes a **Context Snapshot**:
-- **Facts**: A deduplicated list of atomic facts extracted from all retrieved chunks.
-- **Workflows**: Identification of specific "how-to" processes mentioned.
-- **Relationships**: A map of connections (e.g., "The API belongs to the Enterprise SDK").
-
-### B. Response Planning
-The Orchestrator agent performs a planning turn:
-- **Goal**: What is the user specifically asking for?
-- **Workflow**: Which site process is being engaged?
-- **Plan**: A step-by-step logical outline for the response.
-
-### C. Grounded Generation
-- The final response is generated using the Planning and Snapshot context.
-- **Strict Hallucination Control**: A post-processing layer checks for bracketed placeholders or robotic filler phrases and strips them before the user sees the output.
-
----
-
-## 4. Security & Multi-Tenancy
-
-- **Isolation**: All data is scoped by `chatbot_id` and `user_id` at the database and vector store levels.
-- **Session Persistence**: User goals and workflow stages are persisted in the database to maintain continuity across sessions.
-- **Data Governance**: Centralized utilities for purging all chatbot-related data (Files, DB, Vectors) upon deletion.
-
----
-*Architecture version: 2.1.0 (Production-Ready)*
+## 4. Multi-Tenant Isolation
+Every request is strictly scoped by `chatbot_id` and `user_id`. The vector store queries include hard metadata filters to prevent any possibility of cross-chatbot data leakage.
